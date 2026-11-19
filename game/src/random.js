@@ -1,0 +1,39 @@
+// A small seeded RNG (mulberry32) so the city, traffic and screenshot scenes are the
+// same for a given seed. ?seed=N fixes it; otherwise a random seed is used.
+// mulberry32 is picked because it is tiny, fast and good enough for placement:
+// the world only needs even-looking scatter, not cryptographic randomness.
+
+export function createRandom(seed) {
+  let a = seed >>> 0;
+  return {
+    next() {
+      a |= 0;
+      a = (a + 0x6d2b79f5) | 0;
+      let t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    },
+    range(min, max) {
+      return min + this.next() * (max - min);
+    },
+    int(min, max) {
+      return Math.floor(this.range(min, max + 1));
+    },
+    pick(list) {
+      if (!list.length) return undefined; // never index into an empty list
+      return list[Math.floor(this.next() * list.length)];
+    },
+    // In-place Fisher-Yates shuffle, so a seeded run deals the same order every time.
+    shuffle(list) {
+      for (let i = list.length - 1; i > 0; i--) {
+        const j = Math.floor(this.next() * (i + 1));
+        [list[i], list[j]] = [list[j], list[i]];
+      }
+      return list;
+    },
+    // True with probability p (0..1): a readable coin flip for scatter decisions.
+    chance(p) {
+      return this.next() < p;
+    },
+  };
+}

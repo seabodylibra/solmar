@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Solmar — an original open-world crime game: steal cars, outrun the Solmar PD and run jobs for Mr. Solano.">
+<meta name="theme-color" content="#0e1a24">
+<title>Solmar — Open-World Crime</title>
+<link rel="icon" href="data:,">
+<style>
+  /* HUD layout: wanted stars top-centre, cash/health top-right, mission
+     tracker top-left, dialogue under the stars, minimap bottom-left, speed
+     bottom-right, prompts and toasts centred. Overlays (title / pause /
+     busted) cover everything. On short screens the controls cheat-sheet is
+     hidden so it never overlaps the speed readout. */
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #0e1a24; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+  #game { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
+  #status { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+  #hud { position: fixed; inset: 0; pointer-events: none; color: #fff; text-shadow: 0 1px 3px rgba(0,0,0,.7); user-select: none; }
+  .panel { background: rgba(8, 18, 28, .55); border: 1px solid rgba(255,255,255,.18); border-radius: 8px; backdrop-filter: blur(2px); }
+  #wanted { position: absolute; top: 14px; left: 50%; transform: translateX(-50%); font-size: 26px; letter-spacing: 4px; color: #ffd23e; padding: 2px 12px; }
+  #wanted .off { color: rgba(255,255,255,.25); }
+  #stats { position: absolute; top: 14px; right: 14px; padding: 8px 12px; text-align: right; min-width: 170px; }
+  #cash { font-size: 22px; font-weight: 800; color: #7dff9b; }
+  #healthbar { height: 10px; background: rgba(255,255,255,.2); border-radius: 5px; margin-top: 6px; overflow: hidden; }
+  #healthfill { height: 100%; width: 100%; background: linear-gradient(90deg, #2ecc71, #7dff9b); }
+  #healthlabel { font-size: 11px; letter-spacing: 1px; opacity: .85; margin-top: 3px; }
+  #ammo { font-size: 13px; margin-top: 4px; opacity: .9; }
+  #mission { position: absolute; top: 14px; left: 14px; padding: 10px 14px; max-width: 340px; }
+  #missionTitle { font-size: 15px; font-weight: 800; color: #ffd23e; letter-spacing: .5px; }
+  #missionObj { font-size: 14px; margin-top: 3px; }
+  #missionDist { font-size: 12px; opacity: .85; margin-top: 2px; }
+  #dialogue { position: absolute; top: 108px; left: 50%; transform: translateX(-50%); max-width: 640px; text-align: center; font-size: 16px; font-style: italic; padding: 8px 16px; }
+  #dialogue b { color: #ffd23e; font-style: normal; }
+  #minimapWrap { position: absolute; left: 14px; bottom: 14px; padding: 6px; border-radius: 50%; }
+  #minimap { display: block; border-radius: 50%; }
+  #speed { position: absolute; right: 16px; bottom: 16px; font-size: 34px; font-weight: 800; text-align: right; }
+  #speed small { font-size: 13px; font-weight: 600; opacity: .8; display: block; }
+  #prompt { position: absolute; left: 50%; bottom: 18%; transform: translateX(-50%); font-size: 17px; font-weight: 700; padding: 8px 16px; }
+  #toast { position: absolute; left: 50%; bottom: 30%; transform: translateX(-50%); font-size: 20px; font-weight: 800; color: #ffd23e; text-align: center; }
+  #controls { position: absolute; right: 14px; bottom: 110px; font-size: 12px; line-height: 1.7; padding: 8px 12px; opacity: .9; }
+  .overlay { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; flex-direction: column; background: linear-gradient(180deg, rgba(6,20,32,.35), rgba(6,20,32,.78)); pointer-events: auto; text-align: center; }
+  .overlay h1 { font-size: 84px; margin: 0; letter-spacing: 10px; color: #ffd23e; text-shadow: 0 4px 0 #b3541e, 0 10px 30px rgba(0,0,0,.8); }
+  .overlay h2 { font-size: 20px; margin: 6px 0 0; letter-spacing: 6px; color: #fff; font-weight: 600; }
+  .overlay p.story { max-width: 560px; font-size: 16px; line-height: 1.6; color: #e8f2f8; margin: 22px 0 8px; }
+  .overlay .btns { margin-top: 22px; display: flex; gap: 14px; }
+  .overlay button { pointer-events: auto; cursor: pointer; font-size: 18px; font-weight: 800; letter-spacing: 1px; padding: 12px 30px; border-radius: 8px; border: 2px solid #ffd23e; background: #ffd23e; color: #1a1206; }
+  .overlay button.ghost { background: transparent; color: #ffd23e; }
+  .overlay button:hover { filter: brightness(1.12); }
+  .overlay .keys { margin-top: 26px; font-size: 13px; line-height: 1.9; color: #cfe3ef; background: rgba(0,0,0,.35); padding: 10px 18px; border-radius: 8px; }
+  .overlay .keys b { color: #ffd23e; }
+  #endTitle { font-size: 64px; }
+  @media (max-height: 640px) { #controls { display: none; } }
+  .hidden { display: none !important; }
+</style>
+<script type="importmap">
+{ "imports": { "three": "./vendor/three.module.min.js" } }
+</script>
+</head>
+<body>
+<canvas id="game" aria-label="Solmar: an open-world crime game. Drive, steal cars, outrun the police and run jobs for Mr. Solano."></canvas>
+<p id="status" role="status" aria-live="polite"></p>
+<div id="hud" class="hidden">
+  <div id="wanted" class="panel"><span class="off">★★★★★</span></div>
+  <div id="stats" class="panel">
+    <div id="cash">$0</div>
+    <div id="healthbar"><div id="healthfill"></div></div>
+    <div id="healthlabel">HEALTH</div>
+    <div id="ammo">PISTOL — 24</div>
+  </div>
+  <div id="mission" class="panel">
+    <div id="missionTitle">SOLMAR</div>
+    <div id="missionObj">Welcome to Solmar.</div>
+    <div id="missionDist"></div>
+  </div>
+  <div id="dialogue" class="panel hidden"></div>
+  <div id="minimapWrap" class="panel"><canvas id="minimap" width="200" height="200"></canvas></div>
+  <div id="speed" class="hidden">0<small>km/h</small></div>
+  <div id="prompt" class="panel hidden"></div>
+  <div id="toast" class="hidden"></div>
+  <div id="controls" class="panel">WASD move / drive &nbsp;·&nbsp; Mouse drag camera<br>E enter / steal car &nbsp;·&nbsp; F shoot &nbsp;·&nbsp; G punch<br>SPACE handbrake &nbsp;·&nbsp; P pause &nbsp;·&nbsp; M mute</div>
+</div>
+<div id="title" class="overlay">
+  <h1>SOLMAR</h1>
+  <h2>AN OPEN-WORLD CRIME STORY</h2>
+  <p class="story">Sun, sea and stolen cars. You are <b>Lena Cruz</b>, the best getaway driver
+  on the coast — broke, fast, and out of options. Fixer <b>Mr. Solano</b> has jobs that pay.
+  Steal a ride, run his packages, and stay ahead of the Solmar PD.</p>
+  <div class="btns">
+    <button id="btnStart">NEW GAME</button>
+    <button id="btnContinue" class="ghost hidden">CONTINUE</button>
+  </div>
+  <div class="keys">
+    <b>WASD</b> move / drive &nbsp;·&nbsp; <b>Mouse drag</b> camera &nbsp;·&nbsp; <b>E</b> enter or steal a car<br>
+    <b>F</b> shoot &nbsp;·&nbsp; <b>G</b> punch &nbsp;·&nbsp; <b>SPACE</b> handbrake &nbsp;·&nbsp; <b>P</b> pause &nbsp;·&nbsp; <b>M</b> mute
+  </div>
+</div>
+<div id="pause" class="overlay hidden">
+  <h2 id="pauseTitle">PAUSED</h2>
+  <p class="story">Solmar waits for no one. Well — right now it does.</p>
+  <div class="btns"><button id="btnResume">RESUME</button><button id="btnQuit" class="ghost">QUIT TO TITLE</button></div>
+</div>
+<div id="end" class="overlay hidden">
+  <h2 id="endTitle">BUSTED</h2>
+  <p class="story" id="endText"></p>
+  <div class="btns"><button id="btnRetry">TRY AGAIN</button><button id="btnEndTitle" class="ghost">TITLE SCREEN</button></div>
+</div>
+<script type="module" src="./src/main.js"></script>
+</body>
+</html>
