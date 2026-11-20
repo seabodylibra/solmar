@@ -1,102 +1,105 @@
-// Particles and flashes: one pooled THREE.Points cloud for bursts (sparks, smoke,
-// muzzle puffs, explosions) and a reusable point light for muzzle flashes and blasts.
-// The pool is fixed at 400: bursts reuse dead particles instead of allocating, so
-// a firefight never grows the scene's memory.
+// Particles and skid marks. Everything here is cosmetic: short-lived dots
+// with velocity and gravity, and dark tyre marks that fade slowly. The game
+// spawns them; this module integrates and draws them.
 
-import * as THREE from 'three';
+export function createEffects() {
+  const particles = [];
+  const skids = [];
 
-const MAX = 400;
-// Muzzle-flash brightness in three.js physical light units; it decays to 0
-// over the flash duration, so the flash reads as a pop rather than a glow.
-const FLASH_INTENSITY = 60;
-
-export function createEffects(scene) {
-  const positions = new Float32Array(MAX * 3);
-  const colors = new Float32Array(MAX * 3);
-  const geo = new THREE.BufferGeometry();
-  geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-  geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-  const mat = new THREE.PointsMaterial({ size: 0.35, vertexColors: true, transparent: true, opacity: 0.95, depthWrite: false });
-  const points = new THREE.Points(geo, mat);
-  points.frustumCulled = false;
-  scene.add(points);
-  const parts = [];
-  for (let i = 0; i < MAX; i += 1) {
-    parts.push({ alive: false, x: 0, y: -999, z: 0, vx: 0, vy: 0, vz: 0, life: 0, maxLife: 1, gravity: 0, r: 1, g: 1, b: 1 });
-    positions[i * 3 + 1] = -999;
+  function burst(x, y, opt) {
+    const count = opt.count ?? 10;
+    const speed = opt.speed ?? 160;
+    const size = opt.size ?? 4;
+    const life = opt.life ?? 0.6;
+    const colors = Array.isArray(opt.color) ? opt.color : [opt.color ?? '#ffffff'];
+    for (let i = 0; i < count; i += 1) {
+      if (particles.length > 420) return;
+      const a = Math.random() * Math.PI * 2;
+      const v = speed * (0.3 + Math.random() * 0.7);
+      particles.push({
+        x, y,
+        vx: Math.cos(a) * v,
+        vy: Math.sin(a) * v,
+        life: life * (0.6 + Math.random() * 0.7),
+        max: life,
+        size: size * (0.6 + Math.random() * 0.8),
+        color: colors[(Math.random() * colors.length) | 0],
+        grav: opt.grav ?? 0,
+        drag: opt.drag ?? 0.9,
+      });
+    }
   }
-  const flash = new THREE.PointLight(0xffffff, 0, 18);
-  scene.add(flash);
-  let flashTime = 0;
-  const color = new THREE.Color();
 
-  return {
-    // Spawns up to `count` particles; returns how many actually spawned
-    // (fewer when the pool is busy, so callers can tell a burst was throttled).
-    burst(pos, hex, count, speed, life, gravity) {
-      color.setHex(hex);
-      let spawned = 0;
-      for (const p of parts) {
-        if (spawned >= count) break;
-        if (p.alive) continue;
-        p.alive = true;
-        p.x = pos.x; p.y = pos.y; p.z = pos.z;
-        const a = Math.random() * Math.PI * 2;
-        const up = (Math.random() - 0.3) * speed;
-        p.vx = Math.sin(a) * speed * (0.4 + Math.random() * 0.6);
-        p.vz = Math.cos(a) * speed * (0.4 + Math.random() * 0.6);
-        p.vy = up;
-        p.life = life * (0.6 + Math.random() * 0.7);
-        p.maxLife = p.life;
-        p.gravity = gravity;
-        p.r = color.r; p.g = color.g; p.b = color.b;
-        spawned += 1;
+  function smoke(x, y) {
+    if (particles.length > 420) return;
+    particles.push({
+      x: x + (Math.random() - 0.5) * 8,
+      y: y + (Math.random() - 0.5) * 8,
+      vx: (Math.random() - 0.5) * 14,
+      vy: -26 - Math.random() * 22,
+      life: 1.1 + Math.random() * 0.5,
+      max: 1.6,
+      size: 7 + Math.random() * 6,
+      color: '#555a60',
+      grav: -14,
+      drag: 0.96,
+    });
+  }
+
+  function flame(x, y) {
+    burst(x, y, { count: 14, color: ['#ff9a3c', '#ff5a2a', '#ffd94a'], speed: 200, size: 5, life: 0.5, grav: -40 });
+  }
+
+  function skid(x, y, angle) {
+    if (skids.length > 500) skids.shift();
+    skids.push({ x, y, angle, life: 9 });
+  }
+
+  function blood(x, y) {
+    burst(x, y, { count: 8, color: ['#c22a2a', '#8f1d1d'], speed: 120, size: 3, life: 0.5 });
+  }
+
+  function update(dt) {
+    for (let i = particles.length - 1; i >= 0; i -= 1) {
+      const p = particles[i];
+      p.life -= dt;
+      if (p.life <= 0) {
+        particles.splice(i, 1);
+        continue;
       }
-      return spawned;
-    },
-    flash(pos, hex, dur) {
-      flash.position.copy(pos);
-      flash.color.setHex(hex);
-      flash.intensity = FLASH_INTENSITY;
-      flashTime = dur;
-    },
-    // How many particles are alive right now (handy for tuning burst sizes).
-    aliveCount() {
-      let n = 0;
-      for (const p of parts) if (p.alive) n += 1;
-      return n;
-    },
-    update(dt) {
-      for (let i = 0; i < MAX; i += 1) {
-        const p = parts[i];
-        if (!p.alive) continue;
-        p.life -= dt;
-        if (p.life <= 0) {
-          p.alive = false;
-          positions[i * 3 + 1] = -999;
-          continue;
-        }
-        p.vy -= p.gravity * dt;
-        p.x += p.vx * dt;
-        p.y += p.vy * dt;
-        p.z += p.vz * dt;
-        if (p.y < 0.05) { p.y = 0.05; p.vy *= -0.3; }
-        positions[i * 3] = p.x;
-        positions[i * 3 + 1] = p.y;
-        positions[i * 3 + 2] = p.z;
-        const fade = p.life / p.maxLife;
-        colors[i * 3] = p.r * fade;
-        colors[i * 3 + 1] = p.g * fade;
-        colors[i * 3 + 2] = p.b * fade;
-      }
-      geo.attributes.position.needsUpdate = true;
-      geo.attributes.color.needsUpdate = true;
-      if (flashTime > 0) {
-        flashTime -= dt;
-        flash.intensity = Math.max(0, flash.intensity - dt * 600);
-      } else {
-        flash.intensity = 0;
-      }
-    },
-  };
+      p.vy += p.grav * dt;
+      p.vx *= p.drag;
+      p.vy *= p.drag;
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+    }
+    for (let i = skids.length - 1; i >= 0; i -= 1) {
+      skids[i].life -= dt;
+      if (skids[i].life <= 0) skids.splice(i, 1);
+    }
+  }
+
+  function draw(ctx, view) {
+    // Skid marks first (under everything that moves).
+    ctx.fillStyle = 'rgba(20, 20, 24, 0.5)';
+    for (const s of skids) {
+      if (!view.contains(s.x, s.y, 30)) continue;
+      ctx.save();
+      ctx.globalAlpha = Math.min(0.55, s.life / 9);
+      ctx.translate(s.x, s.y);
+      ctx.rotate(s.angle);
+      ctx.fillRect(-7, -2.5, 14, 5);
+      ctx.restore();
+    }
+    ctx.globalAlpha = 1;
+    for (const p of particles) {
+      if (!view.contains(p.x, p.y, 30)) continue;
+      ctx.globalAlpha = Math.max(0, p.life / p.max);
+      ctx.fillStyle = p.color;
+      ctx.fillRect(p.x - p.size / 2, p.y - p.size / 2, p.size, p.size);
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  return { particles, skids, burst, smoke, flame, skid, blood, update, draw };
 }

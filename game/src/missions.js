@@ -1,190 +1,309 @@
-// The story: five jobs for fixer Mr. Solano, from stealing your first ride to the big
-// getaway, plus repeatable taxi fares once the story is done. Each mission names its
-// objective, its map target and its reward; the game loop asks this module what to
-// show and whether the player just finished (or failed) a job.
-// Lifecycle: startMission opens a job, updateMissions watches it every step, and a
-// job ends only through completeMission (reward + next job) or failMission (retry
-// the same job) — the loop never advances the index itself.
+// Solmar's story: Lena Cruz, getaway driver, working jobs for the fixer
+// Mr. Solano. Five missions in a chain, each a list of stages (go somewhere,
+// get in a kind of car, grab something, beat a clock). A waypoint marks the
+// current goal on the map and the minimap; dialogue lines play at each
+// beat. Taxis and courier packages offer side cash between jobs.
 
-import * as THREE from 'three';
-import { MISSION_REWARDS, TAXI_FARE_MIN, TAXI_FARE_MAX, PITCH } from './config.js';
+import { PLACES } from './config.js';
+import { pick, range } from './random.js';
 
-// Quiet seconds between taxi fares, so a new passenger never appears the
-// instant the last one pays.
-const TAXI_COOLDOWN = 18;
-// How long after the story ends before the first taxi fare offers itself.
-const FIRST_FARE_WAIT = 6;
-// Distance to a marker that counts as arriving (story targets and taxi stops).
-const ARRIVAL_DIST = 8;
-// Grace period before a scripted wanted level may start decaying.
-const SCRIPTED_HEAT_GRACE = 20;
-
-const STORY = [
+export const MISSIONS = [
   {
-    id: 'wheels',
-    title: '1 · WHEELS',
-    objective: 'Steal a car — any car. Press E near one.',
-    dialogue: ['SOLANO', 'Lena, baby. You want work, you need wheels. Take any car on the street — nobody here locks their doors.'],
-    target: null,
-    reward: MISSION_REWARDS[0],
+    id: 1,
+    title: 'First Pickup',
+    reward: 200,
+    briefing: "Mr. Solano: Lena, a client left a red sports car at Plaza del Sol. Bring it to my garage. Don't scratch it.",
+    stages: [
+      { type: 'goto', x: PLACES.plaza.x, y: PLACES.plaza.y, r: 80, text: 'Get to the sports car at Plaza del Sol' },
+      { type: 'enter', kind: 'sports', text: 'Get in the sports car' },
+      { type: 'goto', x: PLACES.garage.x, y: PLACES.garage.y, r: 90, text: 'Bring the car to Solmar Garage' },
+    ],
   },
   {
-    id: 'pickup',
-    title: '2 · THE PICKUP',
-    objective: 'Drive to the Marina and collect the package.',
-    dialogue: ['SOLANO', 'A package is waiting at the Marina, south-east docks. Bring it to me and don\'t stop for anyone.'],
-    target: 'marina',
-    reward: MISSION_REWARDS[1],
+    id: 2,
+    title: 'The Package',
+    reward: 250,
+    briefing: "A package is waiting at the docks. Pick it up and bring it to my office. Keep your head down.",
+    stages: [
+      { type: 'goto', x: PLACES.docks.x, y: PLACES.docks.y, r: 80, text: 'Pick up the package at the Docks' },
+      { type: 'goto', x: PLACES.office.x, y: PLACES.office.y, r: 80, text: "Deliver the package to Solano's Office" },
+    ],
   },
   {
-    id: 'heat',
-    title: '3 · HEAT',
-    objective: 'The cops are onto you. Lose the wanted level!',
-    dialogue: ['SOLANO', 'Somebody talked. The PD has your plate — three stars, Lena. Shake them. Lay low till it cools off.'],
-    target: null,
-    wanted: 3,
-    reward: MISSION_REWARDS[2],
+    id: 3,
+    title: 'Hot Pursuit',
+    reward: 350,
+    briefing: 'The cops impounded a taxi with my ledger inside. Steal a taxi, then lose the heat and bring it to the hideout.',
+    stages: [
+      { type: 'enter', kind: 'taxi', text: 'Steal a taxi' },
+      { type: 'goto', x: PLACES.hideout.x, y: PLACES.hideout.y, r: 100, text: 'Lose the cops and reach the Hideout', clearWanted: true },
+    ],
   },
   {
-    id: 'drop',
-    title: '4 · THE DROP',
-    objective: 'Deliver the package to North Tower — 90 seconds!',
-    dialogue: ['SOLANO', 'North Tower, top of the map. My buyer waits ninety seconds, then walks. Drive like you mean it.'],
-    target: 'northTower',
-    timer: 90,
-    reward: MISSION_REWARDS[3],
+    id: 4,
+    title: 'The Courier',
+    reward: 400,
+    briefing: 'A client needs a delivery across town in 90 seconds. No excuses, no stops.',
+    stages: [
+      { type: 'goto', x: PLACES.docks.x, y: PLACES.docks.y, r: 80, text: 'Pick up the delivery at the Docks' },
+      { type: 'timed', x: PLACES.hospital.x, y: PLACES.hospital.y, r: 90, seconds: 90, text: 'Deliver to St. Marina Hospital — fast!' },
+    ],
   },
   {
-    id: 'getaway',
-    title: '5 · THE GETAWAY',
-    objective: 'Four stars and counting. Reach the beach and vanish.',
-    dialogue: ['SOLANO', 'Last job, Lena. Every cop in Solmar is coming. Get to the beach, south-west — and don\'t look back.'],
-    target: 'beach',
-    wanted: 4,
-    reward: MISSION_REWARDS[4],
+    id: 5,
+    title: 'The Big Score',
+    reward: 800,
+    briefing: "The bank. In and out, grab the cash, and don't stop until you see the marina. This is the one, Lena.",
+    stages: [
+      { type: 'goto', x: PLACES.bank.x, y: PLACES.bank.y, r: 80, text: 'Get to First Solmar Bank' },
+      { type: 'grab', x: PLACES.bank.x, y: PLACES.bank.y, r: 70, text: 'Grab the cash', stars: 4, take: 500 },
+      { type: 'goto', x: PLACES.marina.x, y: PLACES.marina.y, r: 100, text: 'Escape to the Marina boat', clearWanted: true },
+    ],
   },
 ];
 
-export function createMissions(landmarks) {
-  return {
-    landmarks,
-    index: 0, // next story mission to start (0..5; 5 = story done)
-    active: null, // the running mission definition, plus runtime state
+export function say(G, speaker, text, seconds = 5) {
+  G.dialogue = { speaker, text, until: G.time + seconds };
+}
+
+export function startMission(G, index) {
+  const def = MISSIONS[index];
+  if (!def) {
+    G.mission = null;
+    return;
+  }
+  G.mission = {
+    index,
+    def,
+    stage: 0,
     timer: 0,
-    taxi: null, // {stage, target, fare, waitAt}
-    storyDone: false,
+    target: null,
+    objective: def.stages[0].text,
+    startedAt: G.time,
   };
+  say(G, 'Mr. Solano', def.briefing, 6);
+  updateTarget(G);
 }
 
-export function startMission(missions, game, index) {
-  const def = STORY[index];
-  if (!def) return;
-  missions.active = { ...def, targetPos: def.target ? missions.landmarks[def.target].clone() : null };
-  missions.timer = def.timer || 0;
-  missions.index = index;
-  game.dialogue(def.dialogue[0], def.dialogue[1]);
-  game.toast(def.title, 3);
-  if (def.wanted) {
-    game.police.stars = def.wanted;
-    game.police.lastCrimeAt = game.time;
-    game.police.decayAt = game.time + SCRIPTED_HEAT_GRACE;
-    game.onWantedChange?.(def.wanted);
+function updateTarget(G) {
+  const m = G.mission;
+  if (!m) return;
+  const stage = m.def.stages[m.stage];
+  if (!stage) {
+    m.target = null;
+    return;
   }
-}
-
-function completeMission(missions, game) {
-  const def = missions.active;
-  game.addCash(def.reward);
-  game.audio.missionComplete();
-  game.toast(`JOB DONE — +$${def.reward}`, 3);
-  missions.active = null;
-  missions.index += 1;
-  if (missions.index >= STORY.length) {
-    missions.storyDone = true;
-    game.dialogue('SOLANO', 'That\'s the whole coast owing you now, Lena. Solmar is yours — drive fares, cause chaos, live large.');
-    game.toast('STORY COMPLETE — SOLMAR IS YOURS', 4);
-    game.onStoryComplete?.();
+  m.objective = stage.text;
+  if (stage.x !== undefined) {
+    m.target = { x: stage.x, y: stage.y, label: stage.text };
   } else {
-    startMission(missions, game, missions.index);
-  }
-  // Save after the index moves, so Continue restarts the next job, not this one.
-  game.onMissionComplete?.();
-}
-
-function failMission(missions, game, reason) {
-  game.toast(`JOB FAILED — ${reason}`, 3);
-  game.dialogue('SOLANO', 'Relax. We do it again. Same job, clean run this time.');
-  startMission(missions, game, missions.index);
-}
-
-function randomRoadTarget(rng) {
-  // Taxi stops sit on a road centreline (a multiple of the road pitch).
-  const road = Math.round(rng.range(-4, 4)) * PITCH;
-  const along = rng.range(-260, 260);
-  if (rng.next() < 0.5) return new THREE.Vector3(along, 0, road);
-  return new THREE.Vector3(road, 0, Math.min(along, 280));
-}
-
-export function updateMissions(missions, dt, game, world) {
-  const playerPos = game.player.inCar ? game.player.inCar.pos : game.player.pos;
-  const m = missions.active;
-  if (m) {
-    if (m.timer > 0) {
-      m.timer -= dt;
-      if (m.timer <= 0) {
-        failMission(missions, game, 'out of time');
-        return;
-      }
-    }
-    if (m.id === 'wheels') {
-      if (game.player.inCar) completeMission(missions, game);
-    } else if (m.id === 'heat') {
-      if (game.police.stars === 0) completeMission(missions, game);
-    } else if (m.targetPos) {
-      const d = Math.hypot(m.targetPos.x - playerPos.x, m.targetPos.z - playerPos.z);
-      if (d < ARRIVAL_DIST) completeMission(missions, game);
-    }
-  }
-  // Taxi fares: only in free roam, after the story.
-  if (missions.storyDone) {
-    const taxi = missions.taxi;
-    if (!taxi) {
-      missions.taxi = { stage: 'wait', target: null, fare: 0, waitAt: game.time + FIRST_FARE_WAIT };
-    } else if (taxi.stage === 'wait' && game.time > taxi.waitAt) {
-      taxi.stage = 'pickup';
-      taxi.target = randomRoadTarget(world.rng);
-      taxi.fare = 0;
-      game.toast('TAXI FARE — pick up the passenger', 3);
-    } else if (taxi.stage === 'pickup' && taxi.target) {
-      if (Math.hypot(taxi.target.x - playerPos.x, taxi.target.z - playerPos.z) < ARRIVAL_DIST) {
-        taxi.stage = 'dropoff';
-        taxi.target = randomRoadTarget(world.rng);
-        taxi.fare = Math.round(world.rng.range(TAXI_FARE_MIN, TAXI_FARE_MAX));
-        game.toast('Passenger aboard — drive to the marker', 2.5);
-        game.audio.pickup();
-      }
-    } else if (taxi.stage === 'dropoff' && taxi.target) {
-      if (Math.hypot(taxi.target.x - playerPos.x, taxi.target.z - playerPos.z) < ARRIVAL_DIST) {
-        game.addCash(taxi.fare);
-        game.audio.cash();
-        game.toast(`FARE PAID — +$${taxi.fare}`, 2.5);
-        missions.taxi = { stage: 'wait', target: null, fare: 0, waitAt: game.time + TAXI_COOLDOWN };
-      }
-    }
+    m.target = null;
   }
 }
 
-/** The current map target: story marker first, then the taxi fare. */
-export function missionTarget(missions) {
-  if (missions.active?.targetPos) return missions.active.targetPos;
-  if (missions.taxi?.target) return missions.taxi.target;
+function completeMission(G) {
+  const m = G.mission;
+  const def = m.def;
+  G.player.cash += def.reward;
+  G.audio.jingle();
+  say(G, 'Mr. Solano', `Job done. $${def.reward} is yours, Lena.`, 5);
+  G.stats.missionsDone += 1;
+  const next = m.index + 1;
+  if (next >= MISSIONS.length) {
+    G.storyDone = true;
+    G.player.cash += 500;
+    say(G, 'Mr. Solano', 'That was the big one. Solmar is yours now — enjoy it.', 7);
+    G.mission = null;
+    return;
+  }
+  G.mission = null;
+  G._nextMissionAt = G.time + 3;
+  G._nextMissionIndex = next;
+}
+
+function failMission(G) {
+  say(G, 'Mr. Solano', 'Too slow. Shake it off and run it again.', 5);
+  const index = G.mission.index;
+  G.mission = null;
+  G._nextMissionAt = G.time + 2;
+  G._nextMissionIndex = index;
+}
+
+function stageDone(G, stage) {
+  const p = G.player;
+  if (stage.type === 'goto' || stage.type === 'timed' || stage.type === 'grab') {
+    return Math.hypot(p.x - stage.x, p.y - stage.y) < stage.r;
+  }
+  if (stage.type === 'enter') {
+    return !!p.inCar && p.inCar.kind === stage.kind;
+  }
+  return false;
+}
+
+function applyStage(G, stage) {
+  if (stage.type === 'grab') {
+    G.player.cash += stage.take || 0;
+    G.wanted.add(stage.stars || 3, 'robbed the bank', G.time);
+    G.danger = { x: G.player.x, y: G.player.y, radius: 320, until: G.time + 2 };
+    say(G, 'Lena', 'Got it — now run!', 3);
+  }
+  if (stage.clearWanted) {
+    G.wanted.stars = 0;
+    G.wanted.busted = 0;
+    say(G, 'Lena', 'Clean. They lost me.', 3);
+  }
+}
+
+export function updateMissions(G, dt) {
+  // Delayed start of the next mission (after one ends or fails).
+  if (G._nextMissionAt !== undefined && G.time >= G._nextMissionAt) {
+    const index = G._nextMissionIndex;
+    G._nextMissionAt = undefined;
+    startMission(G, index);
+  }
+  const m = G.mission;
+  if (!m) return;
+  const stage = m.def.stages[m.stage];
+  if (!stage) return;
+
+  if (stage.type === 'timed') {
+    if (m.timer <= 0) m.timer = stage.seconds;
+    m.timer -= dt;
+    if (m.timer <= 0) {
+      failMission(G);
+      return;
+    }
+  }
+
+  if (stageDone(G, stage)) {
+    applyStage(G, stage);
+    // Stealing the taxi in mission 3 draws the heat.
+    if (m.def.id === 3 && m.stage === 0) {
+      G.wanted.add(2, 'stole the ledger taxi', G.time);
+      say(G, 'Dispatch', 'All units: stolen taxi, last seen downtown.', 4);
+    }
+    m.stage += 1;
+    if (m.stage >= m.def.stages.length) {
+      completeMission(G);
+      return;
+    }
+    const next = m.def.stages[m.stage];
+    m.timer = 0;
+    updateTarget(G);
+    if (next.type === 'timed') say(G, 'Mr. Solano', `${next.seconds} seconds. Go!`, 3);
+  }
+}
+
+/** The current waypoint (mission first, then the side job). */
+export function currentTarget(G) {
+  if (G.mission && G.mission.target) return G.mission.target;
+  if (G.job && G.job.target) return G.job.target;
   return null;
 }
 
-export function missionObjective(missions) {
-  if (missions.active) return { title: missions.active.title, text: missions.active.objective, timer: missions.active.timer || 0 };
-  if (missions.taxi?.stage === 'pickup') return { title: 'TAXI FARE', text: 'Pick up the passenger at the marker.', timer: 0 };
-  if (missions.taxi?.stage === 'dropoff') return { title: 'TAXI FARE', text: `Drop the passenger off — fare $${missions.taxi.fare}.`, timer: 0 };
-  if (missions.storyDone) return { title: 'FREE ROAM', text: 'Solmar is yours. A taxi fare will appear shortly.', timer: 0 };
-  return { title: 'SOLMAR', text: 'Welcome to Solmar.', timer: 0 };
+// ---- Side jobs: taxi fares and courier packages. ----
+
+function spawnTaxiFare(G) {
+  const ped = pick(G.rng, G.peds.filter((p) => p.down <= 0 && p.state === 'walk'));
+  if (!ped) return;
+  G.job = {
+    type: 'taxi',
+    stage: 'pickup',
+    fare: ped,
+    target: { x: ped.x, y: ped.y, label: 'Taxi fare' },
+    reward: 0,
+    timer: 0,
+  };
+}
+
+function spawnCourier(G) {
+  const spot = G.city.randomRoadPoint();
+  G.job = {
+    type: 'courier',
+    stage: 'pickup',
+    target: { x: spot.x, y: spot.y, label: 'Courier package' },
+    reward: 0,
+    timer: 0,
+    dest: null,
+  };
+}
+
+export function updateJobs(G, dt) {
+  const p = G.player;
+  // Offer a taxi fare while driving a taxi.
+  if (!G.job && p.inCar && p.inCar.kind === 'taxi') {
+    G._taxiWait = (G._taxiWait ?? 0) + dt;
+    if (G._taxiWait > 6) {
+      G._taxiWait = 0;
+      spawnTaxiFare(G);
+      if (G.job) say(G, 'Fare', 'Taxi! Over here!', 3);
+    }
+  }
+  // Offer a courier package now and then when nothing else is going on.
+  if (!G.job && !p.inCar) {
+    G._courierWait = (G._courierWait ?? 0) + dt;
+    if (G._courierWait > 50) {
+      G._courierWait = 0;
+      spawnCourier(G);
+    }
+  }
+  const job = G.job;
+  if (!job) return;
+
+  if (job.type === 'taxi') {
+    if (job.stage === 'pickup') {
+      if (!p.inCar || p.inCar.kind !== 'taxi') {
+        G.job = null;
+        return;
+      }
+      const fare = job.fare;
+      job.target = { x: fare.x, y: fare.y, label: 'Taxi fare' };
+      if (Math.hypot(p.x - fare.x, p.y - fare.y) < 48) {
+        // Passenger hops in.
+        fare.down = 999;
+        G.peds = G.peds.filter((q) => q !== fare);
+        const spot = G.city.randomRoadPoint();
+        job.stage = 'dropoff';
+        job.dest = spot;
+        job.target = { x: spot.x, y: spot.y, label: 'Drop off the fare' };
+        job.reward = 50 + Math.round(Math.hypot(spot.x - fare.x, spot.y - fare.y) / 100) * 10;
+        say(G, 'Fare', 'Downtown, and step on it!', 3);
+      }
+    } else if (job.stage === 'dropoff') {
+      if (Math.hypot(p.x - job.dest.x, p.y - job.dest.y) < 55) {
+        p.cash += job.reward;
+        G.audio.pickup();
+        say(G, 'Fare', `Thanks! Keep the change — $${job.reward}.`, 3);
+        G.job = null;
+      }
+    }
+    return;
+  }
+
+  if (job.type === 'courier') {
+    if (job.stage === 'pickup') {
+      if (Math.hypot(p.x - job.target.x, p.y - job.target.y) < 38) {
+        const spot = G.city.randomRoadPoint();
+        job.stage = 'deliver';
+        job.dest = spot;
+        job.target = { x: spot.x, y: spot.y, label: 'Deliver the package' };
+        job.timer = 60;
+        job.reward = 60;
+        say(G, 'Dispatch', 'Package collected. 60 seconds to deliver.', 3);
+      }
+    } else if (job.stage === 'deliver') {
+      job.timer -= dt;
+      if (job.timer <= 0) {
+        say(G, 'Dispatch', 'Too slow — the package went to someone else.', 3);
+        G.job = null;
+        return;
+      }
+      if (Math.hypot(p.x - job.dest.x, p.y - job.dest.y) < 55) {
+        p.cash += job.reward;
+        G.audio.pickup();
+        say(G, 'Dispatch', `Delivered. $${job.reward} on its way.`, 3);
+        G.job = null;
+      }
+    }
+  }
 }

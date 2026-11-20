@@ -1,76 +1,47 @@
-// The third-person camera: it trails behind the player on foot and behind the car when
-// driving, eases toward its target so it never snaps, and lets the mouse drag orbit it.
-// The shot stager drives it directly for screenshots.
-// Yaw is a world angle: 0 looks north (-z in three.js terms is 0 here by the
-// sin/cos below), and it grows clockwise seen from above.
+// The follow camera. It chases the player (or the player's car) with a soft
+// spring, keeps the view inside the map, and converts between world and
+// screen coordinates for the renderer and the mouse aim.
 
-import * as THREE from 'three';
+export function createCamera() {
+  const cam = { x: 0, y: 0, zoom: 0.92, tx: 0, ty: 0 };
 
-// Mouse-drag orbit feel: radians of yaw/pitch per pixel dragged.
-const ORBIT_YAW_PER_PX = 0.005;
-const ORBIT_PITCH_PER_PX = 0.004;
-
-// How close/far the camera may ever sit: shared by the setter, orbit zoom and
-// setDistance, so no caller can park it inside the player's head or a block away.
-const MIN_DISTANCE = 6;
-const MAX_DISTANCE = 20;
-// Pitch limits: never level with the ground, never straight overhead.
-const PITCH_MIN = 0.08;
-const PITCH_MAX = 1.1;
-
-export function createCamera(camera) {
-  let yaw = Math.PI; // world angle the camera sits behind (0 = looking north)
-  let pitch = 0.32;
-  let distance = 11;
-  let freeOrbit = false; // when true, driving never pulls the camera behind the car
-  const target = new THREE.Vector3();
-  const desired = new THREE.Vector3();
-  const up = new THREE.Vector3(0, 1, 0);
-
-  return {
-    get yaw() { return yaw; },
-    set yaw(v) { yaw = v; },
-    get pitch() { return pitch; },
-    set pitch(v) { pitch = Math.max(PITCH_MIN, Math.min(PITCH_MAX, v)); },
-    get distance() { return distance; },
-    // Clamp like orbit() does, so a scripted distance can never sit inside the
-    // player's head or a block away.
-    set distance(v) { distance = Math.max(MIN_DISTANCE, Math.min(MAX_DISTANCE, v)); },
-    set free(v) { freeOrbit = v; },
-    /** Drag deltas orbit the camera; wheel zooms. */
-    orbit(dx, dy, wheel) {
-      yaw -= dx * ORBIT_YAW_PER_PX;
-      pitch = Math.max(PITCH_MIN, Math.min(PITCH_MAX, pitch + dy * ORBIT_PITCH_PER_PX));
-      if (wheel) distance = Math.max(MIN_DISTANCE, Math.min(MAX_DISTANCE, distance + wheel * 0.01));
-    },
-    /** Snap behind a heading (used when entering a car or staging a shot). */
-    snapBehind(heading) {
-      yaw = heading;
-    },
-    // Same clamp as the setter: a scripted distance obeys the same limits.
-    setDistance(d) { distance = Math.max(MIN_DISTANCE, Math.min(MAX_DISTANCE, d)); },
-    update(dt, focusPos, focusHeading, driving) {
-      if (driving && !freeOrbit) {
-        // Driving: the camera swings behind the car's heading unless the player orbits.
-        const diff = ((focusHeading - yaw + Math.PI * 3) % (Math.PI * 2)) - Math.PI;
-        yaw += diff * Math.min(1, dt * 1.6);
-      }
-      target.copy(focusPos);
-      target.y += driving ? 1.6 : 1.4;
-      const dist = driving ? distance + 2.5 : distance;
-      const height = Math.sin(pitch) * dist;
-      const flat = Math.cos(pitch) * dist;
-      desired.set(
-        target.x - Math.sin(yaw) * flat,
-        target.y + height,
-        target.z - Math.cos(yaw) * flat,
-      );
-      // Keep the camera out of the ground and ease toward the desired spot.
-      desired.y = Math.max(desired.y, 1.2);
-      const k = 1 - Math.exp(-dt * (driving ? 7 : 10));
-      camera.position.lerp(desired, k);
-      camera.lookAt(target);
-      camera.up.copy(up);
-    },
+  cam.follow = function follow(targetX, targetY, dt) {
+    cam.tx = targetX;
+    cam.ty = targetY;
+    // Soft spring: fast enough to feel attached, loose enough to feel smooth.
+    const k = 1 - Math.exp(-6 * dt);
+    cam.x += (cam.tx - cam.x) * k;
+    cam.y += (cam.ty - cam.y) * k;
   };
+
+  cam.snap = function snap(targetX, targetY) {
+    cam.x = targetX;
+    cam.y = targetY;
+    cam.tx = targetX;
+    cam.ty = targetY;
+  };
+
+  /** Clamp the view so it never shows past the map edge. */
+  cam.clamp = function clamp(viewW, viewH) {
+    const halfW = viewW / 2 / cam.zoom;
+    const halfH = viewH / 2 / cam.zoom;
+    cam.x = Math.max(halfW, Math.min(2560 - halfW, cam.x));
+    cam.y = Math.max(halfH, Math.min(1920 - halfH, cam.y));
+  };
+
+  cam.worldToScreen = function worldToScreen(wx, wy, viewW, viewH) {
+    return {
+      x: (wx - cam.x) * cam.zoom + viewW / 2,
+      y: (wy - cam.y) * cam.zoom + viewH / 2,
+    };
+  };
+
+  cam.screenToWorld = function screenToWorld(sx, sy, viewW, viewH) {
+    return {
+      x: (sx - viewW / 2) / cam.zoom + cam.x,
+      y: (sy - viewH / 2) / cam.zoom + cam.y,
+    };
+  };
+
+  return cam;
 }

@@ -1,164 +1,188 @@
-// Combat: the pistol (hitscan with a short range and a little spread), fists, health
-// and ammo pickups scattered around Solmar, and the damage numbers the rest of the
-// game listens to. Shooting or punching a civilian or a cop raises the wanted level.
+// Combat: the pistol, bullets, and pickups. The player aims with the mouse
+// and fires with click or Space; officers shoot back from three stars. A
+// bullet is a fast tracer that stops at the first thing it meets — a wall,
+// a car, a pedestrian, a cop, or Lena herself. Pickups (health, ammo, cash)
+// dot the city and respawn.
 
-import * as THREE from 'three';
-import { PLAYER, WANTED } from './config.js';
-import { knockDown } from './pedestrians.js';
+import { PISTOL } from './config.js';
+import { hitPedestrian } from './pedestrians.js';
+import { damageCar } from './vehicles.js';
+import { hurtPlayer } from './player.js';
+import { chance, pick, range } from './random.js';
 
-const GUN_RANGE = 38;
-const GUN_DAMAGE = 34;
-// Aim cone: a target counts as "in the line of fire" when its direction from the
-// player is within ~20 degrees of the facing (cos 20° ≈ 0.94).
-const AIM_CONE_COS = 0.94;
-// A punch only lands on someone roughly in front: within ~60 degrees (cos 60° = 0.5).
-const PUNCH_CONE_COS = 0.5;
-// Pickup values and how long a taken pickup stays gone before it respawns.
-const AMMO_PICKUP = 24;
-const HEALTH_PICKUP = 40;
-const PICKUP_RESPAWN_SECS = 45;
+const PICKUP_KINDS = ['health', 'ammo', 'cash', 'cash'];
 
-export function createPickups(scene, rng) {
+export function spawnPickups(city, rng, count) {
   const pickups = [];
-  const spots = [
-    [60, -60], [-120, 120], [180, -180], [-60, 240], [240, 60],
-    [-240, -120], [120, 180], [0, -240], [-180, 0], [200, 240],
-  ];
-  for (let i = 0; i < spots.length; i += 1) {
-    const kind = i % 2 === 0 ? 'ammo' : 'health';
-    const color = kind === 'ammo' ? 0xffd23e : 0x2ecc71;
-    const mesh = new THREE.Mesh(
-      new THREE.BoxGeometry(0.9, 0.9, 0.9),
-      new THREE.MeshLambertMaterial({ color, emissive: color, emissiveIntensity: 0.35 }),
-    );
-    mesh.position.set(spots[i][0], 0.7, spots[i][1]);
-    mesh.castShadow = true;
-    scene.add(mesh);
-    pickups.push({ kind, mesh, pos: mesh.position, taken: false, respawnAt: 0 });
+  for (let i = 0; i < count; i += 1) {
+    const spot = city.randomSidewalkPoint();
+    pickups.push({
+      x: spot.x, y: spot.y,
+      kind: pick(rng, PICKUP_KINDS),
+      amount: 0,
+      bob: range(rng, 0, 6),
+    });
+  }
+  for (const p of pickups) {
+    p.amount = p.kind === 'health' ? 30 : p.kind === 'ammo' ? 24 : 40;
   }
   return pickups;
 }
 
-export function updatePickups(pickups, dt, game, time) {
-  const playerPos = game.player.inCar ? game.player.inCar.pos : game.player.pos;
-  for (const p of pickups) {
-    if (p.taken) {
-      if (time > p.respawnAt) {
-        p.taken = false;
-        p.mesh.visible = true;
-      }
-      continue;
-    }
-    p.mesh.rotation.y += dt * 1.5;
-    p.mesh.position.y = 0.7 + Math.sin(time * 2 + p.pos.x) * 0.12;
-    const d = Math.hypot(p.pos.x - playerPos.x, p.pos.z - playerPos.z);
-    if (d < 2.2 && !game.player.inCar) {
-      p.taken = true;
-      p.mesh.visible = false;
-      p.respawnAt = time + PICKUP_RESPAWN_SECS;
-      if (p.kind === 'ammo') {
-        game.ammo += AMMO_PICKUP;
-        game.toast(`AMMO +${AMMO_PICKUP}`, 2);
-      } else {
-        game.player.health = Math.min(PLAYER.maxHealth, game.player.health + HEALTH_PICKUP);
-        game.toast(`HEALTH +${HEALTH_PICKUP}`, 2);
-      }
-      game.audio.pickup();
-    }
-  }
+function respawnPickup(G) {
+  const spot = G.city.randomSidewalkPoint();
+  const kind = pick(G.rng, PICKUP_KINDS);
+  G.pickups.push({
+    x: spot.x, y: spot.y, kind,
+    amount: kind === 'health' ? 30 : kind === 'ammo' ? 24 : 40,
+    bob: range(G.rng, 0, 6),
+  });
 }
 
-/** Fire the pistol from the player's facing. Returns 'hit' | 'miss' | 'noammo'. */
-export function shoot(game, world) {
-  if (game.ammo <= 0) {
-    game.audio.denied();
-    return 'noammo';
-  }
-  game.ammo -= 1;
-  game.audio.gunshot();
-  const player = game.player;
-  const ox = player.pos.x;
-  const oz = player.pos.z;
-  const dirX = Math.sin(player.heading);
-  const dirZ = Math.cos(player.heading);
-  const muzzle = new THREE.Vector3(ox + dirX * 1.2, 1.4, oz + dirZ * 1.2);
-  world.effects.burst(muzzle, 0xffd23e, 6, 4, 0.15, 0);
-  world.effects.flash(muzzle, 0xffc861, 0.08);
-  // Nearest living thing roughly in the line of fire.
-  let best = null;
-  let bestD = GUN_RANGE;
-  const consider = (x, z, obj, kind) => {
-    const dx = x - ox;
-    const dz = z - oz;
-    const d = Math.hypot(dx, dz);
-    if (d > bestD || d < 0.5) return;
-    const along = (dx * dirX + dz * dirZ) / d;
-    if (along < AIM_CONE_COS) return; // outside the ~20 degree aim cone
-    bestD = d;
-    best = { obj, kind };
-  };
-  for (const ped of world.peds) if (ped.state !== 'down') consider(ped.pos.x, ped.pos.z, ped, 'ped');
-  for (const cop of world.police.cops) if (cop.health > 0) consider(cop.pos.x, cop.pos.z, cop, 'cop');
-  for (const car of world.cars) {
-    if (car === player.inCar || car.health <= 0) continue;
-    consider(car.pos.x, car.pos.z, car, 'car');
-  }
-  if (!best) return 'miss';
-  const hitPos = new THREE.Vector3(ox + dirX * bestD, 1.1, oz + dirZ * bestD);
-  world.effects.burst(hitPos, 0xff5533, 10, 5, 0.3, 2);
-  if (best.kind === 'ped') {
-    knockDown(best.obj);
-    game.addCrime(WANTED.hitPed, 'pedestrian down');
-    game.toast('You hit a pedestrian!', 2);
-  } else if (best.kind === 'cop') {
-    best.obj.health -= GUN_DAMAGE;
-    if (best.obj.health <= 0) {
-      best.obj.group.rotation.x = -Math.PI / 2;
-      best.obj.group.position.y = 0.25;
-      game.addCrime(WANTED.killCop, 'cop down');
-      game.toast('You took down a cop!', 2);
-    }
-  } else if (best.kind === 'car') {
-    best.obj.health -= GUN_DAMAGE;
-    if (best.obj.health <= 0) world.explodeCar?.(best.obj);
-  }
-  return 'hit';
+function fireBullet(G, from, x, y, angle, damage) {
+  G.bullets.push({
+    x: x + Math.cos(angle) * 22,
+    y: y + Math.sin(angle) * 22,
+    vx: Math.cos(angle) * PISTOL.bulletSpeed,
+    vy: Math.sin(angle) * PISTOL.bulletSpeed,
+    life: PISTOL.range / PISTOL.bulletSpeed,
+    from,
+    damage,
+  });
+  G.effects.burst(x + Math.cos(angle) * 24, y + Math.sin(angle) * 24, {
+    count: 3, color: ['#ffd94a', '#fff2b0'], speed: 60, size: 3, life: 0.12,
+  });
+  G.danger = { x, y, radius: 260, until: G.time + 1.2 };
 }
 
-/** Punch the nearest person in front of the player. Returns true if it connected. */
-export function punch(game, world) {
-  const player = game.player;
-  if (player.punchCooldown > 0) return false;
-  player.punchCooldown = 0.45;
-  game.audio.punch();
-  const dirX = Math.sin(player.heading);
-  const dirZ = Math.cos(player.heading);
-  let best = null;
-  let bestD = PLAYER.punchRange;
-  const consider = (x, z, obj, kind) => {
-    const dx = x - player.pos.x;
-    const dz = z - player.pos.z;
-    const d = Math.hypot(dx, dz);
-    if (d > bestD) return;
-    if ((dx * dirX + dz * dirZ) / Math.max(d, 0.01) < PUNCH_CONE_COS) return;
-    bestD = d;
-    best = { obj, kind };
-  };
-  for (const ped of world.peds) if (ped.state !== 'down') consider(ped.pos.x, ped.pos.z, ped, 'ped');
-  for (const cop of world.police.cops) if (cop.health > 0) consider(cop.pos.x, cop.pos.z, cop, 'cop');
-  if (!best) return false;
-  const hitPos = new THREE.Vector3(best.obj.pos.x, 1.2, best.obj.pos.z);
-  world.effects.burst(hitPos, 0xffffff, 8, 4, 0.25, 2);
-  if (best.kind === 'ped') {
-    knockDown(best.obj);
-    game.addCrime(WANTED.hitPed, 'assault');
-  } else {
-    best.obj.health -= PLAYER.punchDamage;
-    if (best.obj.health <= 0) {
-      best.obj.group.rotation.x = -Math.PI / 2;
-      best.obj.group.position.y = 0.25;
-      game.addCrime(WANTED.killCop, 'cop down');
+export function tryShoot(G, input) {
+  const p = G.player;
+  if (p.inCar || p.health <= 0 || p.reloading > 0 || p.shootCooldown > 0) return false;
+  const mouse = input.mouse();
+  const wantFire = mouse.down || input.takeClick();
+  if (!wantFire) return false;
+  if (p.ammo <= 0) {
+    // Dry click: reload if there is reserve.
+    if (p.reserve > 0) p.reloading = PISTOL.reloadTime;
+    else G.audio.denied();
+    return false;
+  }
+  p.ammo -= 1;
+  p.shootCooldown = PISTOL.cooldown;
+  const world = G.camera.screenToWorld(mouse.x, mouse.y, G.viewW, G.viewH);
+  const angle = Math.atan2(world.y - p.y, world.x - p.x);
+  fireBullet(G, 'player', p.x, p.y, angle, PISTOL.damage);
+  G.audio.shot();
+  G.stats.shotsFired += 1;
+  // Firing where the law can see it draws heat.
+  let seen = false;
+  for (const cop of G.cops) {
+    if (cop.down < 900 && Math.hypot(cop.x - p.x, cop.y - p.y) < 460) {
+      seen = true;
+      break;
     }
   }
+  if (!seen) {
+    for (const car of G.cars) {
+      if (car.kind === 'police' && !car.dead && Math.hypot(car.x - p.x, car.y - p.y) < 460) {
+        seen = true;
+        break;
+      }
+    }
+  }
+  if (seen) G.wanted.add(1, 'fired a gun in public', G.time);
   return true;
+}
+
+export function tryReload(G) {
+  const p = G.player;
+  if (p.inCar || p.reloading > 0 || p.ammo >= PISTOL.mag || p.reserve <= 0) return false;
+  p.reloading = PISTOL.reloadTime;
+  return true;
+}
+
+export function updateCombat(G, dt) {
+  // Bullets.
+  for (let i = G.bullets.length - 1; i >= 0; i -= 1) {
+    const b = G.bullets[i];
+    b.life -= dt;
+    const nx = b.x + b.vx * dt;
+    const ny = b.y + b.vy * dt;
+    let dead = b.life <= 0;
+    if (!dead && G.city.blocked(nx, ny, 2)) {
+      G.effects.burst(nx, ny, { count: 4, color: ['#ffd94a', '#c8c8c8'], speed: 90, size: 2, life: 0.25 });
+      dead = true;
+    }
+    if (!dead) {
+      b.x = nx;
+      b.y = ny;
+      if (b.from === 'player') {
+        // Pedestrians and cops.
+        for (const ped of G.peds) {
+          if (ped.down > 0) continue;
+          if (Math.hypot(ped.x - b.x, ped.y - b.y) < 14) {
+            hitPedestrian(G, ped, false);
+            G.wanted.add(1, 'shot a pedestrian', G.time);
+            dead = true;
+            break;
+          }
+        }
+        if (!dead) {
+          for (const cop of G.cops) {
+            if (cop.down > 0 || cop.down >= 900) continue;
+            if (Math.hypot(cop.x - b.x, cop.y - b.y) < 14) {
+              cop.down = 3;
+              G.effects.blood(cop.x, cop.y);
+              G.wanted.add(2, 'shot a cop', G.time);
+              dead = true;
+              break;
+            }
+          }
+        }
+        if (!dead) {
+          for (const car of G.cars) {
+            if (car.dead) continue;
+            if (Math.hypot(car.x - b.x, car.y - b.y) < 20) {
+              damageCar(G, car, b.damage, true);
+              dead = true;
+              break;
+            }
+          }
+        }
+      } else if (b.from === 'cop') {
+        const p = G.player;
+        if (!p.inCar && p.health > 0 && Math.hypot(p.x - b.x, p.y - b.y) < 14) {
+          hurtPlayer(G, b.damage);
+          dead = true;
+        } else if (p.inCar && Math.hypot(p.inCar.x - b.x, p.inCar.y - b.y) < 20) {
+          damageCar(G, p.inCar, b.damage * 0.4, false);
+          dead = true;
+        }
+      }
+    }
+    if (dead) G.bullets.splice(i, 1);
+  }
+
+  // Pickups: bob, and get collected by the player (on foot or driving over).
+  for (let i = G.pickups.length - 1; i >= 0; i -= 1) {
+    const pk = G.pickups[i];
+    pk.bob += dt * 3;
+    const d = Math.hypot(G.player.x - pk.x, G.player.y - pk.y);
+    if (d < 30) {
+      const p = G.player;
+      if (pk.kind === 'health' && p.health < p.maxHealth) {
+        p.health = Math.min(p.maxHealth, p.health + pk.amount);
+      } else if (pk.kind === 'ammo') {
+        p.reserve += pk.amount;
+      } else if (pk.kind === 'cash') {
+        p.cash += pk.amount;
+      } else {
+        continue;
+      }
+      G.audio.pickup();
+      G.effects.burst(pk.x, pk.y, { count: 8, color: ['#7be07b', '#ffd94a'], speed: 80, size: 3, life: 0.4 });
+      G.pickups.splice(i, 1);
+      respawnPickup(G);
+    }
+  }
 }

@@ -1,201 +1,158 @@
-// The Solmar PD: a wanted level from 0 to 5 stars, police cruisers that chase and ram,
-// and foot cops who run the player down and make the bust. Stars rise with crimes and
-// fall when the player stays clean and out of sight.
-// Spawns use the world's seeded RNG, never Math.random: a seeded world must play
-// out the same way every time, or the staged screenshot scenes would not repeat.
+// The wanted system: stars 0-5, earned by crime and shed by lying low.
+// The police answer with cars (and, from two stars, officers on foot) who
+// chase Lena and try to bust her. Getting busted costs cash and the car;
+// getting wasted costs a hospital trip.
 
-import * as THREE from 'three';
-import { WANTED, POLICE_MAX_CARS } from './config.js';
-import { createCar, steerToward, TRAFFIC_COLORS } from './vehicles.js';
+import { COP, WANTED } from './config.js';
+import { makeCar } from './vehicles.js';
+import { chance, pick, range } from './random.js';
 
-// A foot cop's punch: damage per hit, and the seconds between swings.
-const COP_PUNCH_DAMAGE = 9;
-const COP_PUNCH_INTERVAL = 0.9;
-// Seconds a cop must stay within arm's reach before the bust lands.
-const BUST_TIME = 2.5;
-// Foot-cop chase speed, and health a cruiser grinds off the player's car per
-// second while ramming it.
-const COP_RUN_SPEED = 5.6;
-const RAM_DAMAGE_PER_SEC = 12;
-
-function buildCopMesh() {
-  const group = new THREE.Group();
-  const navy = new THREE.MeshLambertMaterial({ color: 0x1a2f4a });
-  const skin = new THREE.MeshLambertMaterial({ color: 0xe0ac69 });
-  const body = new THREE.Mesh(new THREE.CylinderGeometry(0.28, 0.34, 0.9, 8), navy);
-  body.position.y = 0.95;
-  body.castShadow = true;
-  group.add(body);
-  const head = new THREE.Mesh(new THREE.SphereGeometry(0.22, 10, 8), skin);
-  head.position.y = 1.62;
-  group.add(head);
-  const cap = new THREE.Mesh(new THREE.CylinderGeometry(0.24, 0.24, 0.1, 10), navy);
-  cap.position.y = 1.8;
-  group.add(cap);
-  const legs = [];
-  const legMat = new THREE.MeshLambertMaterial({ color: 0x141c26 });
-  for (const x of [-0.11, 0.11]) {
-    const leg = new THREE.Mesh(new THREE.BoxGeometry(0.16, 0.55, 0.18), legMat);
-    leg.position.set(x, 0.28, 0);
-    group.add(leg);
-    legs.push(leg);
-  }
-  return { group, legs };
-}
-
-export function createPolice(scene) {
-  return {
+export function createWanted() {
+  const w = {
     stars: 0,
-    lastCrimeAt: -999,
-    decayAt: 0,
-    cars: [], // police cruisers
-    cops: [], // foot cops {group, legs, pos, heading, health, punchAt, walkPhase}
-    bustTimer: 0,
-    scene,
+    lastCrime: -999,
+    busted: 0,
+    _decay: 0,
+    add(n, why, now) {
+      if (n <= 0) return;
+      w.stars = Math.min(WANTED.max, w.stars + n);
+      w.lastCrime = now;
+      w._decay = 0;
+    },
+    /** Called every frame with the game clock. */
+    update(G, dt) {
+      // Stars fall when the heat is off: no crime for a while, and no police
+      // close enough to keep the chase alive.
+      if (w.stars > 0 && G.time - w.lastCrime > WANTED.decayDelay) {
+        let near = false;
+        for (const car of G.cars) {
+          if (car.kind === 'police' && !car.dead && Math.hypot(car.x - G.player.x, car.y - G.player.y) < 420) {
+            near = true;
+            break;
+          }
+        }
+        if (!near) {
+          w._decay = (w._decay ?? 0) + dt;
+          if (w._decay >= WANTED.decayInterval) {
+            w._decay = 0;
+            w.stars -= 1;
+          }
+        } else {
+          w._decay = 0;
+        }
+      }
+      maintainPolice(G, dt);
+      updateFootCops(G, dt);
+    },
   };
+  return w;
 }
 
-export function addWanted(police, amount, time) {
-  const before = police.stars;
-  police.stars = Math.min(WANTED.max, police.stars + amount);
-  police.lastCrimeAt = time;
-  police.decayAt = time + WANTED.decayDelay;
-  return police.stars > before;
+function policeCarCount(stars) {
+  return stars <= 0 ? 0 : stars === 1 ? 1 : stars === 2 ? 2 : stars === 3 ? 3 : stars === 4 ? 4 : COP.maxCars;
 }
 
-function spawnPoliceCar(police, world, target) {
-  const angle = world.rng.next() * Math.PI * 2;
-  const x = Math.max(-280, Math.min(280, target.x + Math.sin(angle) * 95));
-  const z = Math.max(-280, Math.min(320, target.z + Math.cos(angle) * 95));
-  const car = createCar(police.scene, 'police', 0xf2f2f2, x, z, Math.atan2(target.x - x, target.z - z));
-  car.targetSpeed = 30;
-  police.cars.push(car);
-  world.cars.push(car);
-  return car;
+function footCopCount(stars) {
+  return stars < 2 ? 0 : stars === 2 ? 1 : stars === 3 ? 2 : stars === 4 ? 4 : COP.maxFoot;
 }
 
-function spawnCop(police, world, target) {
-  const angle = world.rng.next() * Math.PI * 2;
-  const { group, legs } = buildCopMesh();
-  group.position.set(
-    Math.max(-280, Math.min(280, target.x + Math.sin(angle) * 45)),
-    0,
-    Math.max(-280, Math.min(320, target.z + Math.cos(angle) * 45)),
-  );
-  police.scene.add(group);
-  const cop = {
-    group, legs, pos: group.position,
-    heading: 0, health: 30, punchAt: 0, walkPhase: world.rng.range(0, 6),
-  };
-  police.cops.push(cop);
-  return cop;
+function spawnPoint(G) {
+  // On a road, 550-750 units from the player, roughly behind the camera edge.
+  const angle = range(G.rng, 0, Math.PI * 2);
+  const dist = range(G.rng, 550, 750);
+  const spot = G.city.nearestRoad(G.player.x + Math.cos(angle) * dist, G.player.y + Math.sin(angle) * dist);
+  const fixed = G.city.collide(spot.x, spot.y, 20);
+  return { x: fixed.x, y: fixed.y };
 }
 
-export function updatePolice(police, dt, world, game) {
-  const time = game.time;
-  const playerPos = game.player.inCar ? game.player.inCar.pos : game.player.pos;
-  const target = playerPos;
-
-  // Clear out cruisers wrecked by ramming (shot ones are removed by explodeCar).
-  for (let i = police.cars.length - 1; i >= 0; i -= 1) {
-    if (police.cars[i].health > 0) continue;
-    const dead = police.cars[i];
-    police.cars.splice(i, 1);
-    const w = world.cars.indexOf(dead);
-    if (w >= 0) world.cars.splice(w, 1);
-    police.scene.remove(dead.group);
+function maintainPolice(G, dt) {
+  const want = policeCarCount(G.wanted.stars);
+  let have = 0;
+  for (const car of G.cars) if (car.kind === 'police' && !car.dead) have += 1;
+  if (have < want) {
+    const spot = spawnPoint(G);
+    const car = makeCar(G.rng, 'police', spot.x, spot.y, range(G.rng, 0, Math.PI * 2));
+    car.driver = 'npc';
+    car.siren = true;
+    G.cars.push(car);
   }
-
-  // Wanted decays once the player has been clean and unseen for a while.
-  if (police.stars > 0 && time > police.decayAt) {
-    const nearest = nearestCopDistance(police, target);
-    if (nearest > 45) {
-      police.decayAt = time + WANTED.decayEvery;
-      police.stars -= 1;
-      game.onWantedChange?.(police.stars);
-    } else {
-      police.decayAt = time + 3;
+  // Clear the streets when the heat is off.
+  if (G.wanted.stars === 0) {
+    for (const car of G.cars) {
+      if (car.kind === 'police' && !car.dead) {
+        const d = Math.hypot(car.x - G.player.x, car.y - G.player.y);
+        if (d > 900) car.dead = true;
+      }
     }
-  }
-
-  // Cruisers: one per star, up to the cap.
-  const wantCars = police.stars > 0 ? Math.min(police.stars, POLICE_MAX_CARS) : 0;
-  while (police.cars.length < wantCars) spawnPoliceCar(police, world, target);
-  while (police.cars.length > wantCars) {
-    const car = police.cars.pop();
-    const i = world.cars.indexOf(car);
-    if (i >= 0) world.cars.splice(i, 1);
-    police.scene.remove(car.group);
-  }
-  // Foot cops join the chase at 2+ stars when the player is on foot.
-  // (Downed cops stay lying where they fell and don't count toward the cap.)
-  const aliveCops = police.cops.filter((c) => c.health > 0).length;
-  const wantCops = police.stars >= 2 && !game.player.inCar ? Math.min(3, police.stars - 1) : 0;
-  for (let i = aliveCops; i < wantCops; i += 1) spawnCop(police, world, target);
-  // Surplus living cops walk off when the heat drops.
-  while (police.cops.filter((c) => c.health > 0).length > wantCops) {
-    const idx = police.cops.findIndex((c) => c.health > 0);
-    if (idx < 0) break;
-    const cop = police.cops[idx];
-    police.cops.splice(idx, 1);
-    police.scene.remove(cop.group);
-  }
-
-  // Flash the light bars.
-  const phase = Math.floor(time * 4) % 2 === 0;
-  for (const car of police.cars) {
-    if (car.lightL) car.lightL.emissiveIntensity = phase ? 2.2 : 0.25;
-    if (car.lightR) car.lightR.emissiveIntensity = phase ? 0.25 : 2.2;
-  }
-
-  // Cruisers chase and ram.
-  for (const car of police.cars) {
-    const dist = steerToward(car, target, dt, 26 + police.stars * 2.5, world);
-    if (dist < 4.5 && game.player.inCar) {
-      const pc = game.player.inCar;
-      pc.health -= RAM_DAMAGE_PER_SEC * dt;
-      pc.speed *= 0.985;
-      if (Math.random() < dt * 2) game.audio.crash();
+    for (const cop of G.cops) {
+      const d = Math.hypot(cop.x - G.player.x, cop.y - G.player.y);
+      if (d > 700) cop.down = 999;
     }
+    G.cops = G.cops.filter((c) => c.down < 900);
   }
+}
 
-  // Foot cops run the player down; staying close builds the bust.
-  let copNear = false;
-  for (const cop of police.cops) {
-    if (cop.health <= 0) continue;
-    const dx = target.x - cop.pos.x;
-    const dz = target.z - cop.pos.z;
-    const dist = Math.hypot(dx, dz);
-    cop.heading = Math.atan2(dx, dz);
-    const speed = dist > 2 ? COP_RUN_SPEED : 0;
-    cop.pos.x += Math.sin(cop.heading) * speed * dt;
-    cop.pos.z += Math.cos(cop.heading) * speed * dt;
-    cop.group.rotation.y = cop.heading;
-    cop.walkPhase += speed * dt * 2.4;
-    const swing = Math.sin(cop.walkPhase) * 0.5;
-    cop.legs[0].rotation.x = swing;
-    cop.legs[1].rotation.x = -swing;
-    if (dist < 2.2) {
-      copNear = true;
-      if (time > cop.punchAt) {
-        cop.punchAt = time + COP_PUNCH_INTERVAL;
-        game.player.health -= COP_PUNCH_DAMAGE;
-        game.audio.punch();
-        game.onPlayerHurt?.();
+function updateFootCops(G, dt) {
+  const want = footCopCount(G.wanted.stars);
+  let have = G.cops.filter((c) => c.down < 900).length;
+  if (have < want) {
+    const spot = spawnPoint(G);
+    G.cops.push({
+      x: spot.x, y: spot.y,
+      angle: 0, speed: 0,
+      down: 0, shootTimer: range(G.rng, 0.5, 1.5),
+      walkPhase: 0,
+    });
+    have += 1;
+  }
+  const player = G.player;
+  const playerSlow = player.inCar ? Math.abs(player.inCar.speed) < 60 : true;
+  let busting = false;
+  for (const cop of G.cops) {
+    if (cop.down >= 900) continue;
+    if (cop.down > 0) {
+      cop.down -= dt;
+      continue;
+    }
+    const dx = player.x - cop.x;
+    const dy = player.y - cop.y;
+    const d = Math.hypot(dx, dy);
+    // Chase on foot, sliding along buildings.
+    const wantAngle = Math.atan2(dy, dx);
+    cop.angle = wantAngle;
+    const fixed = G.city.collide(cop.x + Math.cos(wantAngle) * COP.footSpeed * dt, cop.y + Math.sin(wantAngle) * COP.footSpeed * dt, 11);
+    cop.x = fixed.x;
+    cop.y = fixed.y;
+    cop.walkPhase += dt * 9;
+    // Close and the player is slow: the bust meter fills.
+    if (d < COP.bustRadius && playerSlow && player.health > 0) busting = true;
+    // Armed from three stars: officers take pot-shots.
+    if (G.wanted.stars >= 3 && d < 420 && d > 90) {
+      cop.shootTimer -= dt;
+      if (cop.shootTimer <= 0) {
+        cop.shootTimer = range(G.rng, 1.2, 2.2);
+        const spread = range(G.rng, -0.16, 0.16);
+        G.bullets.push({
+          x: cop.x, y: cop.y,
+          vx: Math.cos(wantAngle + spread) * 620,
+          vy: Math.sin(wantAngle + spread) * 620,
+          life: 0.9, from: 'cop', damage: 8,
+        });
+        G.audio.shot();
       }
     }
   }
-  police.bustTimer = copNear ? police.bustTimer + dt : Math.max(0, police.bustTimer - dt * 2);
-  if (police.bustTimer > BUST_TIME) game.onBusted?.('The Solmar PD caught up with Lena on foot.');
-}
-
-function nearestCopDistance(police, target) {
-  let best = Infinity;
-  for (const car of police.cars) best = Math.min(best, Math.hypot(car.pos.x - target.x, car.pos.z - target.z));
-  for (const cop of police.cops) {
-    if (cop.health > 0) best = Math.min(best, Math.hypot(cop.pos.x - target.x, cop.pos.z - target.z));
+  const w = G.wanted;
+  if (busting) {
+    w.busted += dt;
+    if (w.busted >= COP.bustTime) {
+      w.busted = 0;
+      G.mode = 'busted';
+      G.audio.music(false);
+      G.audio.engine(0, false);
+      G.audio.siren(false);
+    }
+  } else {
+    w.busted = Math.max(0, w.busted - dt * 1.5);
   }
-  return best;
 }
-
-export { TRAFFIC_COLORS };
